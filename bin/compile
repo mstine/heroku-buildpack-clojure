@@ -34,7 +34,7 @@ else
 fi
 
 # Make sure new JDK is visible to Leiningen
-export PATH="$HOME/.jdk/bin:$PATH"
+export PATH="$HOME/app/.jdk/bin:$HOME/.jdk/bin:$PATH"
 
 # Determine Leiningen version
 if [ "$(grep ":min-lein-version[[:space:]]\+\"2" $1/project.clj)" != "" ]; then
