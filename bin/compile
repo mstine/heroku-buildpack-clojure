@@ -5,8 +5,9 @@
 set -e
 
 # parse args
-BUILD_DIR=$1
-CACHE_DIR=$2
+export BUILD_DIR=$1
+export CACHE_DIR=$2
+export ENV_DIR=$3
 
 # Load common JVM functionality from https://github.com/heroku/heroku-buildpack-jvm-common
 JVM_COMMON_BUILDPACK=https://heroku-jvm-common.s3.amazonaws.com/jvm-buildpack-common.tar.gz
@@ -37,10 +38,15 @@ fi
 export PATH="$HOME/app/.jdk/bin:$HOME/.jdk/bin:$PATH"
 
 # Determine Leiningen version
-if [ "$(grep ":min-lein-version[[:space:]]\+\"2" $1/project.clj)" != "" ]; then
-  LEIN_VERSION="2.1.2"
+if [ "$(grep ":min-lein-version[[:space:]]\+\"2" $BUILD_DIR/project.clj)" != "" ]; then
+  LEIN_VERSION="2.3.4"
   LEIN_BIN_SOURCE="$(dirname $0)/../opt/lein2"
-  LEIN_BUILD_TASK=${LEIN_BUILD_TASK:-"with-profile production compile :all"}
+  if [ "$(grep :uberjar-name $BUILD_DIR/project.clj)" != "" ]; then
+      LEIN_BUILD_TASK="${LEIN_BUILD_TASK:-uberjar}"
+      LEIN_INCLUDE_IN_SLUG="${LEIN_INCLUDE_IN_SLUG:-no}"
+  else
+      LEIN_BUILD_TASK=${LEIN_BUILD_TASK:-"with-profile production compile :all"}
+  fi
 else
   LEIN_VERSION="1.7.1"
   LEIN_BIN_SOURCE="$(dirname $0)/../opt/lein1"
@@ -49,17 +55,19 @@ else
     export LEIN_NO_DEV=y
   fi
   RLWRAP=yes
+  echo "Warning: no :min-lein-version found in project.clj; using $LEIN_VERSION."
 fi
 
 # install leiningen jar
 LEIN_JAR_URL="https://heroku-buildpack-clojure.s3.amazonaws.com/leiningen-$LEIN_VERSION-standalone.jar"
-LEIN_JAR_PATH="$CACHE_DIR/leiningen-$LEIN_VERSION-standalone.jar"
+LEIN_JAR_CACHE_PATH="$CACHE_DIR/leiningen-$LEIN_VERSION-standalone.jar"
+LEIN_JAR_SLUG_PATH="$BUILD_DIR/.lein/leiningen-$LEIN_VERSION-standalone.jar"
 
-if [ ! -r "$LEIN_JAR_PATH" ]; then
+if [ ! -r "$LEIN_JAR_CACHE_PATH" ]; then
   echo "-----> Installing Leiningen"
   echo "       Downloading: leiningen-$LEIN_VERSION-standalone.jar"
-  mkdir -p $(dirname $LEIN_JAR_PATH)
-  curl --silent --show-error --max-time 120 -L -o $LEIN_JAR_PATH $LEIN_JAR_URL
+  mkdir -p $(dirname $LEIN_JAR_CACHE_PATH)
+  curl --silent --show-error --max-time 120 -L -o "$LEIN_JAR_CACHE_PATH" $LEIN_JAR_URL
 else
   echo "-----> Using cached Leiningen $LEIN_VERSION"
 fi
@@ -69,7 +77,7 @@ if [ "$LEIN_VERSION" = "1.7.1" ]; then
 fi
 
 mkdir -p "$BUILD_DIR/.lein"
-cp "$LEIN_JAR_PATH" "$BUILD_DIR/.lein/leiningen-$LEIN_VERSION-standalone.jar"
+cp "$LEIN_JAR_CACHE_PATH" "$LEIN_JAR_SLUG_PATH"
 
 # install rlwrap binary on lein 1.x
 if [ "$RLWRAP" = "yes" ]; then
@@ -104,6 +112,23 @@ fi
 
 echo "-----> Building with Leiningen"
 
+# extract environment
+if [ -d "$ENV_DIR" ]; then
+    # if BUILD_CONFIG_WHITELIST is set, read it to know which configs to export
+    if [ -r $ENV_DIR/BUILD_CONFIG_WHITELIST ]; then
+        for e in $(cat $ENV_DIR/BUILD_CONFIG_WHITELIST); do
+            export "$e=$(cat $ENV_DIR/$e)"
+        done
+    # otherwise default BUILD_CONFIG_WHITELIST to just private repo creds
+    else
+        for e in LEIN_USERNAME LEIN_PASSWORD LEIN_PASSPHRASE; do
+            if [ -r $ENV_DIR/$e ]; then
+                export "$e=$(cat $ENV_DIR/$e)"
+            fi
+        done
+    fi
+fi
+
 # Calculate build command
 if [ "$BUILD_COMMAND" = "" ]; then
     if [ -x $BUILD_DIR/bin/build ]; then
@@ -117,7 +142,8 @@ fi
 echo "       Running: $BUILD_COMMAND"
 
 cd $BUILD_DIR
-PATH=.lein/bin:$PATH LEIN_JVM_OPTS="-Xmx500m -Duser.home=$BUILD_DIR" \
+PATH=.lein/bin:$PATH JVM_OPTS="-Xmx600m" \
+  LEIN_JVM_OPTS="-Xmx400m -Duser.home=$BUILD_DIR" \
   $BUILD_COMMAND 2>&1 | sed -u 's/^/       /'
 if [ "${PIPESTATUS[*]}" != "0 0" ]; then
   echo " !     Failed to build."
@@ -128,14 +154,14 @@ fi
 PROFILE_PATH="$BUILD_DIR/.profile.d/clojure.sh"
 mkdir -p $(dirname $PROFILE_PATH)
 
-echo "export JVM_OPTS=\"\${JVM_OPTS:--Xmx400m}\"" >> $PROFILE_PATH
+echo "export JVM_OPTS=\"\${JVM_OPTS:--Xmx400m -Dfile.encoding=UTF-8}\"" >> $PROFILE_PATH
 echo "export LEIN_NO_DEV=\"\${LEIN_NO_DEV:-yes}\"" >> $PROFILE_PATH
-echo "export PATH=\"$HOME/.jdk/bin:$PATH:\$HOME/.lein/bin\"" >> $PROFILE_PATH
+echo "export PATH=\"\$HOME/.jdk/bin:$PATH:\$HOME/.lein/bin\"" >> $PROFILE_PATH
 
 # default Procfile
-if [ ! -r $1/Procfile ]; then
+if [ ! -r $BUILD_DIR/Procfile ]; then
   echo "       No Procfile; using \"web: lein with-profile production trampoline run\"."
-  echo "web: lein with-profile production trampoline run" > $1/Procfile
+  echo "web: lein with-profile production trampoline run" > $BUILD_DIR/Procfile
 fi
 
 # repack cache with new assets
@@ -143,6 +169,11 @@ rm -rf $CACHE_STORE_DIR
 mkdir -p $(dirname $CACHE_STORE_DIR)
 cp -r $CACHE_TARGET_DIR $CACHE_STORE_DIR
 
+if [ "$LEIN_INCLUDE_IN_SLUG" = "no" ]; then
+    rm "$LEIN_JAR_SLUG_PATH"
+    rm -rf "$CACHE_TARGET_DIR"
+fi
+
 if [ "$LEIN_VERSION" = "1.7.1" ]; then
-    rm -rf $CACHE_TARGET_DIR
+    rm -rf "$CACHE_TARGET_DIR"
 fi
